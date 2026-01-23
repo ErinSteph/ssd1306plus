@@ -1,4 +1,6 @@
-# MicroPython SSD1306 OLED driver, I2C and SPI interfaces
+# ssd1306plus - extended I2C and SPI SSD1306 oled driver
+# v1.1.0 - added GIF support
+# v1.0.0 - initial
 
 from micropython import const
 import framebuf
@@ -92,6 +94,301 @@ class SSD1306(framebuf.FrameBuffer):
         self.write_cmd(SET_COM_OUT_DIR | ((rotate & 1) << 3))
         self.write_cmd(SET_SEG_REMAP | (rotate & 1))
         
+        
+    def play_gif(self, filename, x=0, y=0, loop=1, delay_ms=None, clear=True):
+        """
+        - filename: path to .gif file on the filesystem
+        - x, y: offset of the GIF's logical screen on the display
+        - loop: number of times to loop; use -1 for infinite
+        - delay_ms: override frame delay (ms). If None, use GIF's own delay.
+        - clear: if True, clear the frame area before drawing each frame
+        - Supports non-interlaced GIFs only.
+        - Blocking: does not return until all loops are done.
+        """
+        import time
+
+        # Read entire GIF file
+        with open(filename, "rb") as f:
+            data = f.read()
+
+        if len(data) < 13:
+            return
+
+        # Header: "GIF87a" or "GIF89a"
+        if not (data.startswith(b"GIF87a") or data.startswith(b"GIF89a")):
+            return
+
+        # Logical Screen Descriptor
+        ls_width  = data[6] | (data[7] << 8)
+        ls_height = data[8] | (data[9] << 8)
+        packed    = data[10]
+        bg_color_index = data[11]
+        # pixel_aspect = data[12]  # not used
+
+        # Global Color Table
+        gct_flag = (packed & 0x80) != 0
+        gct_size = 0
+        global_color_table = None
+
+        p = 13  # position after header + LSD
+        if gct_flag:
+            gct_size = 1 << ((packed & 0x07) + 1)
+            gct_bytes = 3 * gct_size
+            global_color_table = data[p:p + gct_bytes]
+            p += gct_bytes
+
+        # Helper: read GIF sub-blocks into one bytes object
+        def _read_subblocks(pos):
+            img_data = bytearray()
+            length = len(data)
+            while pos < length:
+                block_len = data[pos]
+                pos += 1
+                if block_len == 0:
+                    break
+                img_data.extend(data[pos:pos + block_len])
+                pos += block_len
+            return bytes(img_data), pos
+
+        # Helper: LZW decode the image data into colour indices
+        def _lzw_decode(img_bytes, min_code_size, expected_pixels):
+            # Simple GIF LZW decoder, up to 12-bit codes
+            if min_code_size < 2 or min_code_size > 8:
+                # Fallback: just truncate raw bytes
+                return list(img_bytes[:expected_pixels])
+
+            clear_code = 1 << min_code_size
+            end_code = clear_code + 1
+            code_size = min_code_size + 1
+            max_code_size = 12
+
+            # Dictionary: code -> [indices...]
+            dictionary = [[i] for i in range(clear_code)] + [None, None]
+
+            bit_pos = 0
+            data_len = len(img_bytes)
+            output = []
+            prev = None
+
+            def _next_code(bit_pos, code_size):
+                byte_pos = bit_pos >> 3
+                if byte_pos >= data_len:
+                    return None, bit_pos
+                raw = 0
+                bits_read = 0
+                shift = 0
+                while bits_read < code_size and byte_pos < data_len:
+                    b = img_bytes[byte_pos]
+                    available = 8 - (bit_pos & 7)
+                    take = code_size - bits_read
+                    if take > available:
+                        take = available
+                    mask = (1 << take) - 1
+                    v = (b >> (bit_pos & 7)) & mask
+                    raw |= v << shift
+                    bits_read += take
+                    shift += take
+                    bit_pos += take
+                    byte_pos = bit_pos >> 3
+                if bits_read != code_size:
+                    return None, bit_pos
+                return raw, bit_pos
+
+            # Initial code
+            code, bit_pos = _next_code(bit_pos, code_size)
+            if code is None:
+                return output
+
+            if code == clear_code:
+                dictionary = [[i] for i in range(clear_code)] + [None, None]
+                code_size = min_code_size + 1
+                code, bit_pos = _next_code(bit_pos, code_size)
+                if code is None or code == end_code:
+                    return output
+
+            if code == end_code:
+                return output
+            if code >= len(dictionary) or dictionary[code] is None:
+                return output
+
+            prev = dictionary[code][:]
+            output.extend(prev)
+
+            while len(output) < expected_pixels:
+                code, bit_pos = _next_code(bit_pos, code_size)
+                if code is None:
+                    break
+
+                if code == clear_code:
+                    dictionary = [[i] for i in range(clear_code)] + [None, None]
+                    code_size = min_code_size + 1
+                    code, bit_pos = _next_code(bit_pos, code_size)
+                    if code is None or code == end_code:
+                        break
+                    if code >= len(dictionary) or dictionary[code] is None:
+                        cur = []
+                    else:
+                        cur = dictionary[code][:]
+                    output.extend(cur)
+                    prev = cur[:]
+                    continue
+
+                if code == end_code:
+                    break
+
+                if code < len(dictionary) and dictionary[code] is not None:
+                    cur = dictionary[code][:]
+                elif code == len(dictionary):
+                    # KwKwK case
+                    cur = prev[:] + [prev[0]]
+                else:
+                    # Invalid code
+                    break
+
+                output.extend(cur)
+                dictionary.append(prev[:] + [cur[0]])
+
+                if len(dictionary) == (1 << code_size) and code_size < max_code_size:
+                    code_size += 1
+
+                prev = cur[:]
+
+            return output[:expected_pixels]
+
+        # Animation loop
+        loops_done = 0
+        infinite = loop < 0
+        start_pos = p  # where the blocks start
+
+        while infinite or loops_done < loop:
+            p = start_pos
+            transparency_index = None
+            frame_delay_ms = 0
+
+            while p < len(data):
+                block_type = data[p]
+                p += 1
+
+                # Trailer: end of GIF
+                if block_type == 0x3B:
+                    break
+
+                # Extension block
+                if block_type == 0x21:
+                    label = data[p]
+                    p += 1
+
+                    # Graphics Control Extension (gives us delay + transparency)
+                    if label == 0xF9:
+                        block_size = data[p]
+                        p += 1
+                        if block_size == 4:
+                            packed_fields = data[p]
+                            p += 1
+                            delay_lo = data[p]
+                            delay_hi = data[p + 1]
+                            p += 2
+                            trans_index = data[p]
+                            p += 1
+                            terminator = data[p]
+                            p += 1
+
+                            frame_delay_ms = (delay_hi << 8 | delay_lo) * 10
+                            if frame_delay_ms <= 0:
+                                frame_delay_ms = 50  # sensible default
+
+                            if packed_fields & 0x01:
+                                transparency_index = trans_index
+                        else:
+                            # Skip odd GCE sizes
+                            sub_len = data[p]
+                            p += 1 + sub_len
+                            while sub_len:
+                                sub_len = data[p]
+                                p += 1 + sub_len
+
+                    else:
+                        # Skip other extension types
+                        sub_len = data[p]
+                        p += 1
+                        while sub_len:
+                            p += sub_len
+                            sub_len = data[p]
+                            p += 1
+
+                    continue
+
+                # Image Descriptor
+                if block_type == 0x2C:
+                    left = data[p] | (data[p + 1] << 8)
+                    top = data[p + 2] | (data[p + 3] << 8)
+                    width = data[p + 4] | (data[p + 5] << 8)
+                    height = data[p + 6] | (data[p + 7] << 8)
+                    packed_fields = data[p + 8]
+                    p += 9
+
+                    lct_flag = (packed_fields & 0x80) != 0
+                    interlace = (packed_fields & 0x40) != 0
+
+                    # Interlaced GIFs not supported: skip them
+                    if interlace:
+                        if lct_flag:
+                            lct_size = 1 << ((packed_fields & 0x07) + 1)
+                            p += 3 * lct_size
+                        # skip image sub-blocks
+                        _, p = _read_subblocks(p + 1)
+                        continue
+
+                    local_color_table = None
+                    if lct_flag:
+                        lct_size = 1 << ((packed_fields & 0x07) + 1)
+                        lct_bytes = 3 * lct_size
+                        local_color_table = data[p:p + lct_bytes]
+                        p += lct_bytes
+
+                    lzw_min_code_size = data[p]
+                    p += 1
+
+                    img_bytes, p = _read_subblocks(p)
+                    expected_pixels = width * height
+                    indices = _lzw_decode(img_bytes, lzw_min_code_size, expected_pixels)
+
+                    # Draw the frame
+                    if clear:
+                        self.fill_rect(x + left, y + top, width, height, 0)
+
+                    pos = 0
+                    bg_idx = bg_color_index  # for our 1-bit mapping
+
+                    for yy in range(height):
+                        for xx in range(width):
+                            if pos >= len(indices):
+                                break
+                            idx = indices[pos]
+                            pos += 1
+
+                            if (transparency_index is not None) and (idx == transparency_index):
+                                # Leave existing pixel as-is
+                                continue
+
+                            col = 0
+                            if idx != bg_idx:
+                                col = 1
+
+                            self.pixel(x + left + xx, y + top + yy, col)
+
+                    self.show()
+
+                    # Frame delay: override if user provided delay_ms
+                    d = delay_ms if (delay_ms is not None) else frame_delay_ms
+                    if d <= 0:
+                        d = 50
+                    time.sleep_ms(d)
+
+                    continue
+
+            loops_done += 1
+
 
     def show(self):
         x0 = 0

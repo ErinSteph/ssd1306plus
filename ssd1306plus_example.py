@@ -1,7 +1,7 @@
-from machine import Pin, SoftI2C
+from machine import Pin, I2C
 import ssd1306plus
 
-i2c = SoftI2C(scl=Pin(5), sda=Pin(18))
+i2c = I2C(scl=Pin(6), sda=Pin(5))
 
 oled_width = 128
 oled_height = 64
@@ -32,5 +32,11 @@ oled.line(105, 30, 113, 50, 1)
 oled.line(121, 30, 113, 50, 1) 
 
 oled.show()
+
+#oled.play_gif("name.gif", x=XPOS, y=YPOS, loop=Number of loops (-1 = Forever)-)
+#use `delay_ms` to override frame delay, set to `None` to use gif's native delay
+#redraw every frame with clear=True
+oled.play_gif("eye.gif", x=30, y=20, loop=-1, clear=True)
+
 
 # Other standard stuff like pixel, framebuf, scroll etc. supported
