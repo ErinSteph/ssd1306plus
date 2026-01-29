@@ -1,9 +1,10 @@
 # ssd1306plus - extended I2C and SPI SSD1306 oled driver
+# v1.2.0 - GIF cropping, garbage collection
 # v1.1.0 - added GIF support
 # v1.0.0 - initial
 
 from micropython import const
-import framebuf
+import framebuf, gc
 
 
 # register definitions
@@ -95,7 +96,7 @@ class SSD1306(framebuf.FrameBuffer):
         self.write_cmd(SET_SEG_REMAP | (rotate & 1))
         
         
-    def play_gif(self, filename, x=0, y=0, loop=1, delay_ms=None, clear=True):
+    def gif(self, filename, x=0, y=0, loop=1, delay_ms=None, clear=False, crop=None):
         """
         - filename: path to .gif file on the filesystem
         - x, y: offset of the GIF's logical screen on the display
@@ -247,7 +248,7 @@ class SSD1306(framebuf.FrameBuffer):
 
                 output.extend(cur)
                 dictionary.append(prev[:] + [cur[0]])
-
+                
                 if len(dictionary) == (1 << code_size) and code_size < max_code_size:
                     code_size += 1
 
@@ -374,11 +375,19 @@ class SSD1306(framebuf.FrameBuffer):
                             col = 0
                             if idx != bg_idx:
                                 col = 1
-
-                            self.pixel(x + left + xx, y + top + yy, col)
+                            notCropped = True
+                            if crop is not None:
+                                if (x + left + xx) < crop[0] or (x + left + xx) >  crop[2]:
+                                    notCropped = False
+                                if (y + top + yy) < crop[1] or (y + top + yy) >  crop[3]:
+                                    notCropped = False
+                            if notCropped == True:
+                                
+                                self.pixel(x + left + xx, y + top + yy, col)
+                            
 
                     self.show()
-
+                    
                     # Frame delay: override if user provided delay_ms
                     d = delay_ms if (delay_ms is not None) else frame_delay_ms
                     if d <= 0:
@@ -386,8 +395,12 @@ class SSD1306(framebuf.FrameBuffer):
                     time.sleep_ms(d)
 
                     continue
-
+            gc.collect()
             loops_done += 1
+            
+            
+    def play_gif(self, filename, x=0, y=0, loop=1, delay_ms=None, clear=False, crop=None):
+        return self.gif(filename, x, y, loop, delay_ms, clear, crop)
 
 
     def show(self):

@@ -1,5 +1,7 @@
 # ssd1306plus
-### Micropython SSD1306 Library with extra features
+### Micro-python SSD1306 Library with extra features
+
+V1.2.0 - GIF cropping, garbage collection
 
 V1.1.0 - Added animated GIF support
 
