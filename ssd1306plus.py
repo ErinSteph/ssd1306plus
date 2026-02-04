@@ -355,13 +355,24 @@ class SSD1306(framebuf.FrameBuffer):
                     indices = _lzw_decode(img_bytes, lzw_min_code_size, expected_pixels)
 
                     # Draw the frame
+                                        # Draw the frame
                     if clear:
                         self.fill_rect(x + left, y + top, width, height, 0)
 
                     pos = 0
                     bg_idx = bg_color_index  # for our 1-bit mapping
 
+                    dst_x0 = x + left
+                    dst_y0 = y + top
+
+                    if crop is not None:
+                        cx0, cy0, cx1, cy1 = crop
+                    else:
+                        # values unused when crop is None
+                        cx0 = cy0 = cx1 = cy1 = 0
+
                     for yy in range(height):
+                        y_pix = dst_y0 + yy
                         for xx in range(width):
                             if pos >= len(indices):
                                 break
@@ -372,21 +383,20 @@ class SSD1306(framebuf.FrameBuffer):
                                 # Leave existing pixel as-is
                                 continue
 
+                            x_pix = dst_x0 + xx
+
+                            if crop is not None:
+                                if (x_pix < cx0) or (x_pix > cx1) or (y_pix < cy0) or (y_pix > cy1):
+                                    continue
+
                             col = 0
                             if idx != bg_idx:
                                 col = 1
-                            notCropped = True
-                            if crop is not None:
-                                if (x + left + xx) < crop[0] or (x + left + xx) >  crop[2]:
-                                    notCropped = False
-                                if (y + top + yy) < crop[1] or (y + top + yy) >  crop[3]:
-                                    notCropped = False
-                            if notCropped == True:
-                                
-                                self.pixel(x + left + xx, y + top + yy, col)
-                            
+
+                            self.pixel(x_pix, y_pix, col)
 
                     self.show()
+
                     
                     # Frame delay: override if user provided delay_ms
                     d = delay_ms if (delay_ms is not None) else frame_delay_ms
@@ -510,3 +520,4 @@ class SSD1306_SPI(SSD1306):
                     for dx in range(scale):
                         for dy in range(scale):
                             self.pixel(x0 + dx, y0 + dy, colr)
+
